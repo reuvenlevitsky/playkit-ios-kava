@@ -30,6 +30,7 @@ let playbackPoints: [KavaPlugin.KavaEventType] = [KavaPlugin.KavaEventType.playR
     
     let viewInterval: TimeInterval = 10
     let timerInterval: TimeInterval = 1
+    let maxViewIdleInterval: TimeInterval = 30
     
     /// Kava event types
     enum KavaEventType : Int {
@@ -76,7 +77,7 @@ let playbackPoints: [KavaPlugin.KavaEventType] = [KavaPlugin.KavaEventType.playR
     var bufferingStartTime: Date?
     var kavaData = KavaPluginData()
     var currentViewTime: TimeInterval = 0
-    var lastViewTime: TimeInterval = 0
+    var lastEventSentTime: TimeInterval = 0
     var joinTimeStart: TimeInterval = 0
     var isViewEventsEnabled = true
     /// A sequence number which describe the order of events in a viewing session.
@@ -137,7 +138,7 @@ let playbackPoints: [KavaPlugin.KavaEventType] = [KavaPlugin.KavaEventType.playR
     }
     
     func registerToBoundaries() {
-        if let player = player, boundaryObservationToken == nil {
+        if let player = player, boundaryObservationToken == nil, !player.isLive() {
             let boundaryFactory = PKBoundaryFactory(duration: player.duration)
             let boundaries = playbackPoints.map({ boundaryFactory.percentageTimeBoundary(boundary: convertToPercentage(type: $0)) })
             boundaryObservationToken = player.addBoundaryObserver(boundaries: boundaries, observeOn: nil) { [weak self] (time, percentage) in
@@ -154,17 +155,6 @@ let playbackPoints: [KavaPlugin.KavaEventType] = [KavaPlugin.KavaEventType.playR
     }
     
     func setupViewTimer() {
-        // If media is live don't setup view timer
-        if let player = self.player {
-            // see if is live via provider
-            if player.isLive() {
-                return
-                // see if live via config
-            } else if let isLive = config.isLive, isLive == true {
-                return
-            }
-        }
-        
         if viewTimer == nil {
             viewTimer = Timer.scheduledTimer(timeInterval: self.timerInterval, target: self, selector: #selector(timerTick), userInfo: nil, repeats: true)
         }
@@ -237,20 +227,25 @@ let playbackPoints: [KavaPlugin.KavaEventType] = [KavaPlugin.KavaEventType.playR
         
         PKLog.debug("Action: \(event)")
         
-        // send event to messageBus
+        // Send event to messageBus
         let eventType = KavaEvent.Report(message: "Kava event: \(event) (\(event.rawValue))")
         self.messageBus?.post(eventType)
         
         let currentTime = Date().timeIntervalSince1970
-        if currentTime - self.lastViewTime > 30 && self.lastViewTime != 0 {
-            self.eventIndex = 1
-            self.kavaData.totalPlayTime = 0
-            self.kavaData.totalBuffering = 0
-            self.kavaData.bitrateSum = 0
-            self.kavaData.bitrateCount = 0
+        
+        if self.isViewEventsEnabled {
+            if currentTime - self.lastEventSentTime > self.maxViewIdleInterval && self.lastEventSentTime != 0 {
+                self.eventIndex = 1
+                self.kavaData.totalPlayTime = 0
+                self.kavaData.totalBuffering = 0
+                self.kavaData.bitrateSum = 0
+                self.kavaData.bitrateCount = 0
+            }
         }
-        self.lastViewTime = currentTime
-        // update total play time
+        
+        self.lastEventSentTime = currentTime
+        
+        // Update total play time
         if player.currentTime > 0 && event == .view {
             self.kavaData.totalPlayTime += (self.kavaData.playTimeInCurrentInterval > 0 ? self.kavaData.playTimeInCurrentInterval : self.viewInterval)
             self.kavaData.playTimeInCurrentInterval = 0
@@ -258,7 +253,7 @@ let playbackPoints: [KavaPlugin.KavaEventType] = [KavaPlugin.KavaEventType.playR
         
         self.kavaData.mediaDuration = player.duration
         
-        // handle media current time, for live send position against real time in "-" (minus values)
+        // Handle media current time. For live, send position against real time in "-" (minus values)
         let mediaCurrentTime: TimeInterval
         if player.isLive() {
             let currentTime = player.currentTime - player.duration
@@ -277,21 +272,36 @@ let playbackPoints: [KavaPlugin.KavaEventType] = [KavaPlugin.KavaEventType.playR
                 PKLog.warning("KalturaRequestBuilder is nil")
                 return
         }
-
+        
         builder.add(headerKey: "User-Agent", headerValue: KavaPlugin.userAgent)
         builder.set { (response: Response) in
             PKLog.debug("Response: \(String(describing: response))")
             
-            guard let data = response.data, let responseJson = JSON(data).dictionary else { return }
+            guard let data = response.data else { return }
             
-            if (self.config.sessionStartTime == nil) {
-                self.config.sessionStartTime = responseJson["time"]?.string
-            }
-            
-            if let viewEventsEnabled = responseJson["viewEventsEnabled"]?.bool {
-                self.isViewEventsEnabled = viewEventsEnabled
+            if JSONSerialization.isValidJSONObject(data) {
+                // Response returned as JSON
+                guard let responseJson = JSON(data).dictionary else { return }
+                
+                if (self.config.sessionStartTime == nil) {
+                    if let sessionStartTime = responseJson["time"]?.number {
+                        self.config.sessionStartTime = sessionStartTime.stringValue
+                    }
+                }
+                
+                if let viewEventsEnabled = responseJson["viewEventsEnabled"]?.bool {
+                    self.isViewEventsEnabled = viewEventsEnabled
+                }
+            } else {
+                // Response returned as String (Old format)
+                if (self.config.sessionStartTime == nil) {
+                    if let sessionStartTime = data as? String {
+                        self.config.sessionStartTime = sessionStartTime
+                    }
+                }
             }
         }
+        
         print("Send Kava Event: \(builder.urlParams!)")
         USRExecutor.shared.send(request: builder.build())
         
@@ -310,21 +320,6 @@ let playbackPoints: [KavaPlugin.KavaEventType] = [KavaPlugin.KavaEventType.playR
         if let player = self.player, !player.isLive() {
             self.config.isLive = player.isLive()
         }
-    }
-}
-
-/* ***********************************************************/
-// MARK: - AppStateObserver
-/* ***********************************************************/
-
-extension KavaPlugin: AppStateObservable {
-    
-    public var observations: Set<NotificationObservation> {
-        return [
-            NotificationObservation(name: .UIApplicationDidEnterBackground, onObserve: { [weak self] in
-                self?.stopViewTimer()
-            })
-        ]
     }
 }
 
